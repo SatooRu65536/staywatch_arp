@@ -3,10 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -15,8 +19,16 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
+var (
+	selectedIface string
+)
+
+func init() {
+	flag.StringVar(&selectedIface, "i", "en0", "select wifi iface")
+}
+
 func main() {
-	var selectedIface = getIfaceFrpmArgs()
+	flag.Parse()
 
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -33,8 +45,11 @@ func main() {
 
 		go func(iface net.Interface) {
 			defer wg.Done()
-			if err := scan(&iface); err != nil {
+			if err, macs := scan(&iface); err != nil {
 				log.Printf("interface %v: %v", iface.Name, err)
+			} else {
+				log.Printf("interface %v: %v", iface.Name, macs)
+				sendApiRequest(macs)
 			}
 		}(iface)
 	}
@@ -42,71 +57,66 @@ func main() {
 	wg.Wait()
 }
 
-func getIfaceFrpmArgs() string {
-	var (
-		s = flag.String("i", "en0", "select wifi interface")
-	)
-
-	flag.Parse()
-
-	return *s
-}
-
-func scan(iface *net.Interface) error {
-
+func scan(iface *net.Interface) (error, []net.HardwareAddr) {
 	var addr *net.IPNet
 	if addrs, err := iface.Addrs(); err != nil {
-		return err
+		return err, nil
 	} else {
 		for _, a := range addrs {
-			if ipnet, ok := a.(*net.IPNet); ok {
-				if ip4 := ipnet.IP.To4(); ip4 != nil {
-					addr = &net.IPNet{
-						IP:   ip4,
-						Mask: ipnet.Mask[len(ipnet.Mask)-4:],
-					}
-					break
-				}
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
 			}
+
+			ip4 := ipnet.IP.To4()
+			if ip4 == nil {
+				continue
+			}
+			addr = &net.IPNet{
+				IP:   ip4,
+				Mask: ipnet.Mask[len(ipnet.Mask)-4:],
+			}
+			break
 		}
 	}
 
 	if addr == nil {
-		return errors.New("no good IP network found")
+		return errors.New("no good IP network found"), nil
 	} else if addr.IP[0] == 127 {
-		return errors.New("skipping localhost")
+		return errors.New("skipping localhost"), nil
 	} else if addr.Mask[0] != 0xff || addr.Mask[1] != 0xff {
-		return errors.New("mask means network is too large")
+		return errors.New("mask means network is too large"), nil
 	}
 	log.Printf("Using network range %v for interface %v", addr, iface.Name)
 
 	handle, err := pcap.OpenLive(iface.Name, 65536, true, pcap.BlockForever)
 	if err != nil {
-		return err
+		return err, nil
 	}
 	defer handle.Close()
 
 	stop := make(chan struct{})
-	go readARP(handle, iface, stop)
-	defer close(stop)
-	for {
+	macAddresses := make(chan []net.HardwareAddr)
+	go readARP(handle, iface, stop, macAddresses)
+	defer close(macAddresses)
+	writeARP(handle, iface, addr)
+	time.Sleep(2 * time.Second)
+	close(stop)
+	macs := <-macAddresses
 
-		if err := writeARP(handle, iface, addr); err != nil {
-			log.Printf("error writing packets on %v: %v", iface.Name, err)
-			return err
-		}
-
-		time.Sleep(10 * time.Second)
-	}
+	return nil, macs
 }
 
-func readARP(handle *pcap.Handle, iface *net.Interface, stop chan struct{}) {
+func readARP(handle *pcap.Handle, iface *net.Interface, stop chan struct{}, macAddresses chan []net.HardwareAddr) {
 	src := gopacket.NewPacketSource(handle, layers.LayerTypeEthernet)
 	in := src.Packets()
+	var macs []net.HardwareAddr
+
 	for {
 		var packet gopacket.Packet
 		select {
 		case <-stop:
+			macAddresses <- macs
 			return
 		case packet = <-in:
 			arpLayer := packet.Layer(layers.LayerTypeARP)
@@ -115,11 +125,10 @@ func readARP(handle *pcap.Handle, iface *net.Interface, stop chan struct{}) {
 			}
 			arp := arpLayer.(*layers.ARP)
 			if arp.Operation != layers.ARPReply || bytes.Equal([]byte(iface.HardwareAddr), arp.SourceHwAddress) {
-
 				continue
 			}
-
 			log.Printf("IP %v is at %v", net.IP(arp.SourceProtAddress), net.HardwareAddr(arp.SourceHwAddress))
+			macs = append(macs, net.HardwareAddr(arp.SourceHwAddress))
 		}
 	}
 }
@@ -169,4 +178,52 @@ func ips(n *net.IPNet) (out []net.IP) {
 		out = append(out, net.IP(buf[:]))
 	}
 	return
+}
+
+type RequestBody struct {
+	MACAddresses []string `json:"MACAddresses"`
+}
+
+func sendApiRequest(macAddresses []net.HardwareAddr) {
+	// string[] に変換
+	var macsStr []string
+	for _, mac := range macAddresses {
+		macsStr = append(macsStr, mac.String())
+	}
+
+	// リクエストボディを作成
+	requestBody := RequestBody{
+		MACAddresses: macsStr,
+	}
+	jsonStr, err := json.Marshal(requestBody)
+	if err != nil {
+		log.Printf("Failed to marshal json: %v", err)
+		return
+	}
+
+	log.Printf("Request body: %v", string(jsonStr))
+
+	endpoint := "https://sysken-stay-watch-api.sysken.net/api/register/set"
+	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonStr))
+	if err != nil {
+		log.Printf("Failed to create request: %v", err)
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	client := new(http.Client)
+	res, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to send request: %v", err)
+		return
+	}
+	defer res.Body.Close()
+
+	bytes, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Printf("Failed to read response: %v", err)
+		return
+	}
+
+	fmt.Println(string(bytes))
 }
