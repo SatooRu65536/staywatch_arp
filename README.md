@@ -36,7 +36,7 @@ ExecStart=go run main.go
 
 6. systemdデーモンの再度読み込み
 ```bash
-sudo systemctl deamon-reload
+sudo systemctl daemon-reload
 ```
 
 7. タイマーを有効にして開始
